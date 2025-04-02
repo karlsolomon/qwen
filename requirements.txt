@@ -1,7 +1,9 @@
 torch
-transformers
-bitsandbytes
+transformers>4.37.0
 accelerate
 uvicorn
 pydantic
 fastapi
+python-multipart
+chromadb
+modelscope
