@@ -51,19 +51,37 @@ def build_prompt():
     return prompt
 
 
-def load_file_to_context() -> str:
+def handle_file_upload() -> str:
     file_path = console.input("[bold yellow]📄 Enter file path: [/bold yellow]").strip()
     if not os.path.isfile(file_path):
         console.print(f"[red]File not found:[/red] {file_path}")
         return ""
-    try:
-        with open(file_path, "r") as f:
-            content = f.read()
-        console.print(f"[green]✔ Loaded file:[/green] {file_path}")
-        return f"\n--- FILE: {os.path.basename(file_path)} ---\n{content}\n--- END FILE ---\n"
-    except Exception as e:
-        console.print(f"[red]Error reading file:[/red] {e}")
-        return ""
+
+    ext = os.path.splitext(file_path)[-1].lower()
+
+    if ext == ".pdf":
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f, "application/pdf")}
+                response = httpx.post("http://localhost:8000/upload", files=files)
+                resp = response.json()
+                if resp.get("status") == "ok":
+                    console.print(f"[green]✔ Uploaded PDF:[/green] {file_path}")
+                else:
+                    console.print(f"[red]❌ Server error:[/red] {resp.get('message')}")
+        except Exception as e:
+            console.print(f"[red]Upload failed:[/red] {e}")
+        return ""  # PDFs go to server context, nothing added to user prompt
+
+    else:
+        try:
+            with open(file_path, "r") as f:
+                content = f.read()
+            console.print(f"[green]✔ Loaded file:[/green] {file_path}")
+            return f"\n--- FILE: {os.path.basename(file_path)} ---\n{content}\n--- END FILE ---\n"
+        except Exception as e:
+            console.print(f"[red]Error reading file:[/red] {e}")
+            return ""
 
 
 async def stream_chat_async(client, full_prompt: str) -> str:
@@ -121,7 +139,7 @@ async def chat_loop():
                 user_input = user_input.strip()
 
                 if user_input == "/upload":
-                    file_to_append = load_file_to_context()
+                    file_to_append = handle_file_upload()
                     continue
 
                 elif user_input == "/clear":

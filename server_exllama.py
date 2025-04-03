@@ -1,14 +1,24 @@
 import asyncio
 import json
+import os
 import threading
 
+import fitz  # PyMuPDF
 import torch
 import uvicorn
 from exllamav2 import ExLlamaV2, ExLlamaV2Cache_Q8, ExLlamaV2Tokenizer
 from exllamav2.config import ExLlamaV2Config
 from exllamav2.generator import ExLlamaV2Sampler, ExLlamaV2StreamingGenerator
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import StreamingResponse
+
+# --- Configs/Flags ---
+MAX_PROMPT_TOKENS = 2048
+MAX_RESPONSE_TOKENS = 8192
+MAX_MEMORY_TOKENS = 32768
+context_history = []
+current_context_tokens = 0
+
 
 # --- Globals ---
 model = None
@@ -52,7 +62,6 @@ def lazy_load_model():
 
         # Load model
         loaded_model = ExLlamaV2(config)
-        # model.length = 8192
         loaded_model.load()
 
         # Tokenizer, cache, generator
@@ -71,6 +80,67 @@ def lazy_load_model():
         print("✅ Model fully loaded.")
 
 
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extracts all text from a PDF file using PyMuPDF."""
+    try:
+        doc = fitz.open(file_path)
+        text = "\n".join(page.get_text() for page in doc)
+        doc.close()
+        return text.strip()
+    except Exception as e:
+        print(f"[PDF Error] Failed to extract text: {e}")
+        return ""
+
+
+def chunk_text(text, max_tokens=MAX_PROMPT_TOKENS):
+    """Chunk the input text into chunks of max_tokens."""
+    chunks = []
+    tokens = tokenizer.encode(text)
+
+    while len(tokens) > max_tokens:
+        chunk = tokens[:max_tokens]
+        tokens = tokens[max_tokens:]
+        chunks.append(tokenizer.decode(chunk))
+
+    if tokens.numel() > 0:
+        chunks.append(tokenizer.decode(tokens))
+
+    return chunks
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile):
+    if file.filename.endswith(".pdf"):
+        contents = await file.read()
+        with open("temp.pdf", "wb") as f:
+            f.write(contents)
+        extracted_text = extract_text_from_pdf("temp.pdf")
+        os.remove("temp.pdf")
+
+        if extracted_text:
+            chunks = chunk_text(extracted_text)
+            for chunk in chunks:
+                # Add each chunk to context or process individually
+                encoded = tokenizer.encode(chunk)
+                add_to_context(len(encoded))
+            return {"status": "ok", "chunks": len(chunks)}
+        else:
+            return {"status": "error", "message": "No text extracted"}
+
+    return {"status": "error", "message": "Unsupported file type"}
+
+
+def add_to_context(new_chunk_tokens):
+    global current_context_tokens
+    if current_context_tokens + new_chunk_tokens > MAX_MEMORY_TOKENS:
+        while current_context_tokens + new_chunk_tokens > MAX_MEMORY_TOKENS:
+            oldest_chunk = context_history.pop(0)
+            current_context_tokens -= len(oldest_chunk)
+
+    context_history.append(new_chunk_tokens)
+    current_context_tokens += new_chunk_tokens
+
+
 @app.post("/chat")
 async def chat(request: Request):
     lazy_load_model()
@@ -78,26 +148,10 @@ async def chat(request: Request):
     body = await request.json()
     prompt = format_prompt(body.get("prompt", ""))
 
-    # ---- Safe tensor creation ----
-    encoded = tokenizer.encode(prompt)
+    # ---- Chunking the prompt if it's more than 2048 tokens ----
+    prompt_chunks = chunk_text(prompt)
 
-    # Convert to tensor if needed
-    if not isinstance(encoded, torch.Tensor):
-        encoded = torch.tensor(encoded, dtype=torch.long)
-
-    # Guarantee shape [1, seq_len]
-    if encoded.ndim == 1:
-        encoded = encoded.unsqueeze(0)
-    elif encoded.ndim == 3:
-        encoded = encoded.view(encoded.size(0), -1)
-
-    # 🔥 Critical: match model's real embedding device
-    embedding_weight_device = generator.model.modules[0].embedding.weight.device
-    input_ids = encoded.contiguous().to(embedding_weight_device)
-
-    print("✅ FINAL input_ids.device:", input_ids.device)
-
-    # ---- Generation settings ----
+    # ---- Initialize the model settings ----
     settings = ExLlamaV2Sampler.Settings()
     settings.temperature = 0.7
     settings.top_k = 50
@@ -105,76 +159,42 @@ async def chat(request: Request):
     settings.token_repetition_penalty = 1.1
     settings.eos_token_id = int(tokenizer.eos_token_id or 151643)
 
-    # ---- Start streaming generation ----
-    generator.begin_stream_ex(input_ids=input_ids, gen_settings=settings)
+    # ---- Process each chunk of prompt separately ----
+    for chunk in prompt_chunks:
+        encoded = tokenizer.encode(chunk)
+        encoded = torch.as_tensor(encoded, dtype=torch.long)
 
-    async def token_stream():
-        while True:
-            result = generator.stream_ex()
-            text = result.get("chunk", "")
-            eos = result.get("eos", False)
+        if encoded.ndim == 1:
+            encoded = encoded.unsqueeze(0)
+        elif encoded.ndim == 3:
+            encoded = encoded.view(encoded.size(0), -1)
 
-            if text:
-                yield json.dumps({"text": text}) + "\n"
-                await asyncio.sleep(0)  # Ensures token flush
+        embedding_weight_device = generator.model.modules[0].embedding.weight.device
+        input_ids = encoded.contiguous().to(embedding_weight_device)
 
-            if eos:
-                break
+        print("✅ input_ids.device:", input_ids.device)
 
-    return StreamingResponse(token_stream(), media_type="text/event-stream")
+        # ---- Add to context ----
+        add_to_context(len(encoded))
 
+        # ---- Start streaming generation ----
+        generator.begin_stream_ex(input_ids=input_ids, gen_settings=settings)
 
-# @app.post("/chat")
-# async def chat(request: Request):
-#     lazy_load_model()
-#
-#     body = await request.json()
-#     prompt = format_prompt(body.get("prompt", ""))
-#
-#     # ---- Safe tensor creation ----
-#     encoded = tokenizer.encode(prompt)
-#     encoded = torch.as_tensor(encoded, dtype=torch.long)
-#
-#     if encoded.ndim == 1:
-#         encoded = encoded.unsqueeze(0)
-#     elif encoded.ndim == 3:
-#         encoded = encoded.view(encoded.size(0), -1)
-#
-#     input_ids = encoded.to(device)
-#
-#     # ---- Generation settings ----
-#     settings = ExLlamaV2Sampler.Settings()
-#     settings.temperature = 0.7
-#     settings.top_k = 50
-#     settings.top_p = 0.9
-#     settings.token_repetition_penalty = 1.1
-#     settings.eos_token_id = int(tokenizer.eos_token_id or 151643)
-#
-#     # ---- Start streaming generation ----
-#     print("✅ input_ids.shape:", input_ids.shape)
-#     print("✅ input_ids.device:", input_ids.device)
-#     print("✅ cache.device:", cache.key_states[0].device)
-#     print("✅ eos_token_id:", settings.eos_token_id, type(settings.eos_token_id))
-#     generator.begin_stream_ex(input_ids=input_ids, gen_settings=settings)
-#     print("🧠 sequence_ids.shape:", generator.sequence_ids.shape)
-#     print("🧠 sequence_ids.device:", generator.sequence_ids.device)
-#     print("🧠 sequence_ids.dtype:", generator.sequence_ids.dtype)
-#
-#     async def token_stream():
-#         while True:
-#             result = generator.stream_ex()
-#             text = result.get("chunk", "")
-#             eos = result.get("eos", False)
-#
-#             if text:
-#                 yield json.dumps({"text": text}) + "\n"
-#                 await asyncio.sleep(0)  # Ensures token flush
-#
-#             if eos:
-#                 break
-#
-#     return StreamingResponse(token_stream(), media_type="text/event-stream")
-#
+        async def token_stream():
+            while True:
+                result = generator.stream_ex()
+                text = result.get("chunk", "")
+                eos = result.get("eos", False)
+
+                if text:
+                    yield json.dumps({"text": text}) + "\n"
+                    await asyncio.sleep(0)  # Ensures token flush
+
+                if eos:
+                    break
+
+        return StreamingResponse(token_stream(), media_type="text/event-stream")
+
 
 if __name__ == "__main__":
     # lazy_load_model()
