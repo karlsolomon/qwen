@@ -36,10 +36,9 @@ def save_chat_history():
 
 
 def clear_chat_history():
+    httpx.post("http://localhost:8000/clear")
     global chat_history
     chat_history = []
-    if os.path.exists(history_path):
-        os.remove(history_path)
     console.print("[yellow]⚠ Chat history cleared.[/yellow]")
 
 
