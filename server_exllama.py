@@ -1,166 +1,181 @@
-import os
-import time
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+import asyncio
+import json
+import threading
 
 import torch
-from exllamav2 import ExLlamaV2Cache_Q8, ExLlamaV2Tokenizer, model_init
+import uvicorn
+from exllamav2 import ExLlamaV2, ExLlamaV2Cache_Q8, ExLlamaV2Tokenizer
+from exllamav2.config import ExLlamaV2Config
 from exllamav2.generator import ExLlamaV2Sampler, ExLlamaV2StreamingGenerator
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
+# --- Globals ---
+model = None
+tokenizer = None
+cache = None
+generator = None
 
-class DummyArgs:
-    model_dir = "/home/ksolomon/git/quant/"
-    gpu_split = None
-    tensor_parallel = False
-    length = 4096
-    rope_scale = None
-    rope_alpha = None
-    rope_yarn = None
-    no_flash_attn = False
-    no_xformers = False
-    no_sdpa = False
-    no_graphs = False
-    low_mem = True
-    experts_per_token = None
-    load_q4 = False
-    fast_safetensors = False
-    ignore_compatibility = True
-    chunk_size = None
-    draft_model_dir = None
-    no_draft_scale = False
-    draft_n_tokens = 5
-    cache_8bit = False
-    cache_q4 = False
-    cache_q6 = False
-    cache_q8 = True
-    temperature = 0.8
-    top_k = 50
-    top_p = 0.95
-    top_a = 0.0
-    typical = 0.0
-    repetition_penalty = 1.1
-    frequency_penalty = 0.0
-    presence_penalty = 0.0
-    smoothing_factor = 0.0
-    xtc_probability = 0.0
-    xtc_threshold = 0.1
-    dry_allowed_length = 2
-    dry_base = 1.75
-    dry_multiplier = 0.0
-    dry_range = 0
-    dynamic_temperature = None
-    mode = "chatml"
-    username = "User"
-    botname = "Bot"
-    system_prompt = None
-    no_system_prompt = False
-    modes = False
-    max_response_tokens = 1000
-    response_chunk = 5
-    print_timings = True
-    amnesia = False
-    ngram_decoding = False
+device = torch.device("cuda:0")
+model_dir = "/home/ksolomon/git/quant"  # <- Update as needed
+load_lock = threading.Lock()
 
-
-args = DummyArgs()
-
+# --- FastAPI app ---
 app = FastAPI()
-model, tokenizer, generator = None, None, None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model, tokenizer, generator
-
-    print("🚀 Loading ExLlamaV2 model...")
-    model, tokenizer = model_init.init(args)
-    cache = ExLlamaV2Cache_Q8(model, lazy=not model.loaded)
-    generator = ExLlamaV2StreamingGenerator(model, cache, tokenizer)
-    yield
+@app.on_event("startup")
+async def startup_event():
+    lazy_load_model()
 
 
-app.router.lifespan_context = lifespan
+def format_prompt(user_input: str) -> str:
+    return f"<|im_start|>user\n{user_input}<|im_end|>\n<|im_start|>assistant\n"
 
 
-@app.post("/v1/chat/completions")
+def lazy_load_model():
+    global model, tokenizer, cache, generator
+
+    if model is not None:
+        return
+
+    with load_lock:
+        if model is not None:
+            return  # Already loaded while waiting
+
+        print("🔁 Loading model...")
+
+        # Load config
+        config = ExLlamaV2Config()
+        config.model_dir = model_dir
+        config.prepare()
+
+        # Load model
+        loaded_model = ExLlamaV2(config)
+        # model.length = 8192
+        loaded_model.load()
+
+        # Tokenizer, cache, generator
+        loaded_tokenizer = ExLlamaV2Tokenizer(config)
+        loaded_cache = ExLlamaV2Cache_Q8(loaded_model, lazy=not loaded_model.loaded)
+        loaded_generator = ExLlamaV2StreamingGenerator(
+            loaded_model, loaded_cache, loaded_tokenizer
+        )
+
+        # Assign to globals
+        model = loaded_model
+        tokenizer = loaded_tokenizer
+        cache = loaded_cache
+        generator = loaded_generator
+
+        print("✅ Model fully loaded.")
+
+
+@app.post("/chat")
 async def chat(request: Request):
-    global generator, tokenizer
+    lazy_load_model()
 
     body = await request.json()
-    messages = body["messages"]
-    prompt_text = messages[-1]["content"]
+    prompt = format_prompt(body.get("prompt", ""))
 
-    input_ids = tokenizer.encode(prompt_text, add_bos=True)
-    target_device = torch.device(f"cuda:{model.device_context[0].device_idx}")
-    input_ids = input_ids.to(target_device)
+    # ---- Safe tensor creation ----
+    encoded = tokenizer.encode(prompt)
 
-    settings = ExLlamaV2Sampler.Settings(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        top_a=args.top_a,
-        typical=args.typical,
-        token_repetition_penalty=args.repetition_penalty,
-        token_frequency_penalty=args.frequency_penalty,
-        token_presence_penalty=args.presence_penalty,
-        smoothing_factor=args.smoothing_factor,
-        xtc_probability=args.xtc_probability,
-        xtc_threshold=args.xtc_threshold,
-        dry_allowed_length=args.dry_allowed_length,
-        dry_base=args.dry_base,
-        dry_multiplier=args.dry_multiplier,
-        dry_range=args.dry_range,
-    )
+    # Convert to tensor if needed
+    if not isinstance(encoded, torch.Tensor):
+        encoded = torch.tensor(encoded, dtype=torch.long)
 
-    if args.dynamic_temperature:
-        dt_args = [float(v) for v in args.dynamic_temperature.split(",")]
-        settings.min_temp = dt_args[0]
-        settings.max_temp = dt_args[1]
-        settings.temp_exponent = dt_args[2]
+    # Guarantee shape [1, seq_len]
+    if encoded.ndim == 1:
+        encoded = encoded.unsqueeze(0)
+    elif encoded.ndim == 3:
+        encoded = encoded.view(encoded.size(0), -1)
 
+    # 🔥 Critical: match model's real embedding device
     embedding_weight_device = generator.model.modules[0].embedding.weight.device
-    input_ids = input_ids.to(embedding_weight_device)
-    generator.begin_stream_ex(input_ids, settings)
+    input_ids = encoded.contiguous().to(embedding_weight_device)
 
-    async def stream_response() -> AsyncGenerator[str, None]:
-        response_text = ""
-        response_tokens = 0
-        time_start = time.time()
+    print("✅ FINAL input_ids.device:", input_ids.device)
 
+    # ---- Generation settings ----
+    settings = ExLlamaV2Sampler.Settings()
+    settings.temperature = 0.7
+    settings.top_k = 50
+    settings.top_p = 0.9
+    settings.token_repetition_penalty = 1.1
+    settings.eos_token_id = int(tokenizer.eos_token_id or 151643)
+
+    # ---- Start streaming generation ----
+    generator.begin_stream_ex(input_ids=input_ids, gen_settings=settings)
+
+    async def token_stream():
         while True:
-            res = generator.stream_ex()
-            chunk = res["chunk"]
-            eos = res["eos"]
-            tokens = res["chunk_token_ids"]
+            result = generator.stream_ex()
+            text = result.get("chunk", "")
+            eos = result.get("eos", False)
 
-            if len(response_text) == 0:
-                chunk = chunk.lstrip()
-            response_text += chunk
+            if text:
+                yield json.dumps({"text": text}) + "\n"
+                await asyncio.sleep(0)  # Ensures token flush
 
-            yield chunk
-            response_tokens += len(tokens[0])
-
-            if eos or response_tokens >= args.max_response_tokens:
+            if eos:
                 break
 
-        if args.print_timings:
-            time_end = time.time()
-            elapsed = time_end - time_start
-            print(
-                f"⚡ Generated {response_tokens} tokens in {elapsed:.2f}s ({response_tokens/elapsed:.2f} tokens/sec)"
-            )
+    return StreamingResponse(token_stream(), media_type="text/event-stream")
 
-    return StreamingResponse(stream_response(), media_type="text/plain")
 
+# @app.post("/chat")
+# async def chat(request: Request):
+#     lazy_load_model()
+#
+#     body = await request.json()
+#     prompt = format_prompt(body.get("prompt", ""))
+#
+#     # ---- Safe tensor creation ----
+#     encoded = tokenizer.encode(prompt)
+#     encoded = torch.as_tensor(encoded, dtype=torch.long)
+#
+#     if encoded.ndim == 1:
+#         encoded = encoded.unsqueeze(0)
+#     elif encoded.ndim == 3:
+#         encoded = encoded.view(encoded.size(0), -1)
+#
+#     input_ids = encoded.to(device)
+#
+#     # ---- Generation settings ----
+#     settings = ExLlamaV2Sampler.Settings()
+#     settings.temperature = 0.7
+#     settings.top_k = 50
+#     settings.top_p = 0.9
+#     settings.token_repetition_penalty = 1.1
+#     settings.eos_token_id = int(tokenizer.eos_token_id or 151643)
+#
+#     # ---- Start streaming generation ----
+#     print("✅ input_ids.shape:", input_ids.shape)
+#     print("✅ input_ids.device:", input_ids.device)
+#     print("✅ cache.device:", cache.key_states[0].device)
+#     print("✅ eos_token_id:", settings.eos_token_id, type(settings.eos_token_id))
+#     generator.begin_stream_ex(input_ids=input_ids, gen_settings=settings)
+#     print("🧠 sequence_ids.shape:", generator.sequence_ids.shape)
+#     print("🧠 sequence_ids.device:", generator.sequence_ids.device)
+#     print("🧠 sequence_ids.dtype:", generator.sequence_ids.dtype)
+#
+#     async def token_stream():
+#         while True:
+#             result = generator.stream_ex()
+#             text = result.get("chunk", "")
+#             eos = result.get("eos", False)
+#
+#             if text:
+#                 yield json.dumps({"text": text}) + "\n"
+#                 await asyncio.sleep(0)  # Ensures token flush
+#
+#             if eos:
+#                 break
+#
+#     return StreamingResponse(token_stream(), media_type="text/event-stream")
+#
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "server_exllama:app",
-        host="0.0.0.0",
-        port=11434,
-        reload=False,
-    )
+    # lazy_load_model()
+    uvicorn.run("server_exllama:app", host="0.0.0.0", port=8000)
