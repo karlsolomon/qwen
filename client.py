@@ -1,66 +1,53 @@
 import json
-import os
 
 import requests
 
+API_URL = "http://localhost:11434/v1/chat/completions"
 
-def main():
-    print("💬 Qwen Chat Interface (streaming, type 'exit' to quit)\n")
-    history = []
+
+def stream_chat():
+    print("💬 Qwen Chat Interface (OpenAI-style streaming, type 'exit' to quit)\n")
 
     while True:
-        user_input = input("🧑 You: ")
-        if user_input.strip().lower() == "exit":
+        user_input = input("🧑 You: ").strip()
+        if user_input.lower() == "exit":
             break
-        if user_input.startswith("/upload "):
-            path = user_input.split("/upload ", 1)[1].strip()
-            with open(path, "rb") as f:
-                files = {"file": (os.path.basename(path), f)}
-                res = requests.post("http://localhost:11434/upload", files=files)
-                print(f"📤 {res.json()['message']}")
-            continue
 
-        if user_input == "/clear":
-            requests.post("http://localhost:11434/clear")
-            print("🧹 Chat history cleared.")
-            history = []
-            continue
-
-        if user_input.startswith("/creative"):
-            mode = user_input.split("/creative", 1)[1].strip()
-            requests.post(f"http://localhost:11434/creative/{mode}")
-            print(f"🎨 Creative mode set to: {mode}")
-            continue
-
-        history.append({"role": "user", "content": user_input})
-
+        headers = {"Content-Type": "application/json"}
         payload = {
-            "model": "Qwen2.5-14B-Instruct-GPTQ",
-            "messages": history,
+            "model": "qwen2.5-14b-exllama",  # adjust name as needed
+            "messages": [{"role": "user", "content": user_input}],
+            "max_tokens": 2048,
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 50,
             "stream": True,
         }
 
         print("🤖 Qwen: ", end="", flush=True)
-        response = requests.post(
-            "http://localhost:11434/v1/chat/completions", json=payload, stream=True
-        )
+        try:
+            response = requests.post(
+                API_URL, headers=headers, json=payload, stream=True
+            )
 
-        reply = ""
-        for line in response.iter_lines():
-            if line:
-                try:
-                    data = json.loads(line.decode("utf-8"))
-                    delta = data["choices"][0]["delta"]
-                    if "content" in delta:
-                        token = delta["content"]
-                        print(token, end="", flush=True)
-                        reply += token
-                except Exception as e:
-                    print(f"⚠️ Error decoding line: {line} -> {e}")
+            for line in response.iter_lines():
+                if line:
+                    if line.startswith(b"data: "):
+                        try:
+                            chunk = json.loads(line[6:].decode("utf-8"))
+                            delta = chunk["choices"][0]["delta"]
+                            if "content" in delta:
+                                print(delta["content"], end="", flush=True)
+                        except json.JSONDecodeError:
+                            print(f"\n⚠️ Error decoding line: {line}")
+                    elif line == b"[DONE]":
+                        break
+        except KeyboardInterrupt:
+            print("\n✋ Interrupted by user")
+            break
 
-        print()
-        history.append({"role": "assistant", "content": reply.strip()})
+        print()  # newline after model response
 
 
 if __name__ == "__main__":
-    main()
+    stream_chat()
