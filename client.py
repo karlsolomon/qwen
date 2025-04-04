@@ -1,16 +1,17 @@
-# client.py: Interactive rich client for chatting with the FastAPI LLM server
+# client.py: Async markdown-aware streaming client for Qwen2.5 server
 
 import argparse
+import asyncio
+import json
 import os
 
 import httpx
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.prompt import Prompt
-from rich.text import Text
 
 console = Console()
-
 API_URL = "http://localhost:8000"
 
 
@@ -37,30 +38,51 @@ def upload_file(path):
         console.print(f"[red]Upload failed:[/red] {response.text}")
 
 
-def stream_chat(prompt):
-    with httpx.stream(
-        "POST",
-        f"{API_URL}/stream",
-        json={"prompt": prompt},
-        headers={"Accept": "text/event-stream"},
-        timeout=None,
-    ) as response:
-        if response.status_code != 200:
-            console.print(f"[red]Error:[/red] {response.text}")
-            return
-        console.print("[blue]Assistant:[/blue]", end=" ", soft_wrap=True)
-        for line in response.iter_lines():
-            if not line:
-                continue
-            if line.startswith("data:"):
-                try:
-                    decoded = line[len("data:") :].strip()
-                    if decoded == "[DONE]":
-                        break
-                    console.print(decoded, end="", highlight=False, soft_wrap=True)
-                except Exception as e:
-                    console.print(f"[red]Decode error:[/red] {e}")
-        console.print("")
+async def stream_chat_async(prompt: str):
+    url = f"{API_URL}/stream"
+    headers = {"Accept": "text/event-stream"}
+    data = {"prompt": prompt}
+
+    text_accum = ""
+    is_first_chunk = True
+
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST", url, headers=headers, json=data, timeout=None
+        ) as response:
+            if response.status_code != 200:
+                console.print(f"[red]Error:[/red] {await response.aread()}")
+                return
+
+            with Live(Markdown(""), refresh_per_second=20, console=console) as live:
+                buffer = ""
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+                    while "\n\n" in buffer:
+                        block, buffer = buffer.split("\n\n", 1)
+                        if block.startswith("data:"):
+                            try:
+                                payload = json.loads(block[len("data:") :])
+                                decoded = payload.get("text", "")
+                                if isinstance(decoded, list):
+                                    decoded = "".join(decoded)
+                                if (
+                                    isinstance(decoded, str)
+                                    and decoded.strip() == "[DONE]"
+                                ):
+                                    live.update(Markdown(text_accum))
+                                    return
+                                if is_first_chunk:
+                                    decoded = decoded.lstrip()
+                                    is_first_chunk = False
+                                text_accum += decoded
+                                live.update(Markdown(text_accum))
+                            except json.JSONDecodeError:
+                                continue
+
+
+def stream_chat(prompt: str):
+    asyncio.run(stream_chat_async(prompt))
 
 
 def main():
