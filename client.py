@@ -55,7 +55,9 @@ def stream_chat(prompt):
             if line.startswith("data:"):
                 try:
                     decoded = line[len("data:") :].strip()
-                    console.print(decoded, end="", soft_wrap=True)
+                    if decoded == "[DONE]":
+                        break
+                    console.print(decoded, end="", highlight=False, soft_wrap=True)
                 except Exception as e:
                     console.print(f"[red]Decode error:[/red] {e}")
         console.print("")

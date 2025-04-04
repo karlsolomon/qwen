@@ -85,10 +85,10 @@ def lazy_load_model():
     )
 
     settings = ExLlamaV2Sampler().Settings()
-    settings.temperature = 0.7
+    settings.temperature = 0.95
     settings.top_k = 50
     settings.top_p = 0.9
-    settings.token_repetition_penalty = 1.1
+    settings.token_repetition_penalty = 2.0
     settings.eos_token_id = tokenizer.eos_token_id or 151643
 
     cache = ExLlamaV2Cache_Q8(model, lazy=not model.loaded)
@@ -105,6 +105,10 @@ def trim_instruction_context():
         f.writelines(instruction_context)
 
 
+def normalize_decoded(output):
+    return " ".join(output) if isinstance(output, list) else output
+
+
 # Core streaming logic
 def generate_stream(prompt: str) -> Generator[str, None, None]:
     global generator, tokenizer, model, settings
@@ -112,7 +116,7 @@ def generate_stream(prompt: str) -> Generator[str, None, None]:
     tokens = 0
     buffer = []
 
-    input_tokens = tokenizer.encode(prompt, add_bos=False, add_eos=False)
+    input_tokens = tokenizer.encode(prompt, add_bos=True, add_eos=True)
     generator.begin_stream_ex(input_tokens, settings)
 
     while True:
@@ -126,13 +130,17 @@ def generate_stream(prompt: str) -> Generator[str, None, None]:
                 tokens += 1
                 if len(buffer) >= CHUNK_SIZE:
                     decoded = tokenizer.decode(torch.tensor(buffer).unsqueeze(0))
-                    yield f"data: {decoded}\n\n"
+                    yield f"data: {normalize_decoded(decoded)}\n\n"
                     buffer.clear()
+
         if eos:
             break
 
     if buffer:
-        yield f"data: {tokenizer.decode(torch.tensor(buffer).unsqueeze(0))}\n\n"
+        final_decoded = tokenizer.decode(torch.tensor(buffer).unsqueeze(0))
+        yield f"data: {normalize_decoded(final_decoded)}\n\n"
+
+    yield "data: [DONE]\n\n"
 
     tps = tokens / (time.time() - start)
     print(f"[Server] {tokens} tokens streamed at {tps:.2f} tokens/sec")
