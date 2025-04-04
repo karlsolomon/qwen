@@ -1,5 +1,7 @@
 # server.py: FastAPI + ExLlamaV2 LLM server with streaming and special command handling
 
+import asyncio
+import json
 import os
 import time
 from typing import Generator
@@ -107,34 +109,30 @@ def trim_instruction_context():
 def generate_stream(prompt: str) -> Generator[str, None, None]:
     global generator, tokenizer, model, settings
     start = time.time()
-
-    input_tokens = tokenizer.encode(prompt, add_bos=False, add_eos=False)
-    input_len = input_tokens.shape[1]
-
-    if input_len > PROMPT_LIMIT:
-        for i in range(0, input_len, PROMPT_LIMIT):
-            part = input_tokens[:, i : i + PROMPT_LIMIT]
-            model.forward(part)
-    else:
-        model.forward(input_tokens)
-
-    generator = generator.begin_stream(input_tokens, settings=settings)
-
     tokens = 0
     buffer = []
 
-    for token in generator:
-        buffer.append(token)
-        tokens += 1
-        if len(buffer) >= CHUNK_SIZE:
-            decoded = tokenizer.decode(torch.tensor(buffer).unsqueeze(0))
-            yield decoded
-            buffer.clear()
-        if token == tokenizer.eos_token_id:
+    input_tokens = tokenizer.encode(prompt, add_bos=False, add_eos=False)
+    generator.begin_stream_ex(input_tokens, settings)
+
+    while True:
+        result = generator.stream_ex()
+        chunk_ids = result.get("chunk_token_ids", None)
+        eos = result.get("eos", False)
+
+        if chunk_ids is not None and chunk_ids.numel() > 0:
+            for token in chunk_ids[0].tolist():
+                buffer.append(token)
+                tokens += 1
+                if len(buffer) >= CHUNK_SIZE:
+                    decoded = tokenizer.decode(torch.tensor(buffer).unsqueeze(0))
+                    yield f"data: {decoded}\n\n"
+                    buffer.clear()
+        if eos:
             break
 
     if buffer:
-        yield tokenizer.decode(torch.tensor(buffer).unsqueeze(0))
+        yield f"data: {tokenizer.decode(torch.tensor(buffer).unsqueeze(0))}\n\n"
 
     tps = tokens / (time.time() - start)
     print(f"[Server] {tokens} tokens streamed at {tps:.2f} tokens/sec")
@@ -174,7 +172,9 @@ async def chat(request: ChatRequest):
 
 @app.post("/stream")
 async def stream_chat(request: ChatRequest):
-    return StreamingResponse(generate_stream(request.prompt), media_type="text/plain")
+    return StreamingResponse(
+        generate_stream(request.prompt), media_type="text/event-stream"
+    )
 
 
 @app.on_event("startup")

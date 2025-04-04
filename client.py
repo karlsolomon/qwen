@@ -1,9 +1,9 @@
-
 # client.py: Interactive rich client for chatting with the FastAPI LLM server
 
-import httpx
 import argparse
 import os
+
+import httpx
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.prompt import Prompt
@@ -38,7 +38,13 @@ def upload_file(path):
 
 
 def stream_chat(prompt):
-    with httpx.stream("POST", f"{API_URL}/stream", json={"prompt": prompt}, timeout=None) as response:
+    with httpx.stream(
+        "POST",
+        f"{API_URL}/stream",
+        json={"prompt": prompt},
+        headers={"Accept": "text/event-stream"},
+        timeout=None,
+    ) as response:
         if response.status_code != 200:
             console.print(f"[red]Error:[/red] {response.text}")
             return
@@ -46,17 +52,20 @@ def stream_chat(prompt):
         for line in response.iter_lines():
             if not line:
                 continue
-            try:
-                token = line.decode("utf-8")
-                console.print(token, end="", soft_wrap=True)
-            except Exception as e:
-                console.print(f"[red]Decode error:[/red] {e}")
+            if line.startswith("data:"):
+                try:
+                    decoded = line[len("data:") :].strip()
+                    console.print(decoded, end="", soft_wrap=True)
+                except Exception as e:
+                    console.print(f"[red]Decode error:[/red] {e}")
         console.print("")
 
 
 def main():
     console.print("[bold green]Local LLM Client[/bold green] 🧠")
-    console.print("Type [bold]/exit[/bold] to quit. Use [bold]/clear[/bold], [bold]/upload <path>[/bold], etc.")
+    console.print(
+        "Type [bold]/exit[/bold] to quit. Use [bold]/clear[/bold], [bold]/upload <path>[/bold], etc."
+    )
     while True:
         user_input = Prompt.ask("[yellow]You[/yellow]")
         if user_input.strip() == "/exit":
