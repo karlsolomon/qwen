@@ -1,212 +1,186 @@
-import json
+# server.py: FastAPI + ExLlamaV2 LLM server with streaming and special command handling
+
 import os
 import time
-from contextlib import asynccontextmanager
-from typing import List
-from uuid import uuid4
+from typing import Generator
 
-from chromadb import Client as ChromaClient
-from chromadb.config import Settings
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import StreamingResponse
-from gptqmodel import GPTQModel
+import torch
+import uvicorn
+from exllamav2 import ExLlamaV2, ExLlamaV2Cache_Q8, ExLlamaV2Tokenizer
+from exllamav2.generator import ExLlamaV2Sampler
+from exllamav2.generator.streaming import ExLlamaV2StreamingGenerator
+from exllamav2.model_init import init as model_init
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from transformers import AutoTokenizer
 
-# --- Config ---
-MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct-GPTQ-Int4"
-DEVICE = "cuda:0"
-MAX_NEW_TOKENS = 8192
+# Configuration constants
+INSTRUCTION_LIMIT = 4096
+CHAT_CONTEXT_LIMIT = 28672
+PROMPT_LIMIT = 2048
+RESPONSE_LIMIT = 4096
+MODEL_DIR = "/home/ksolomon/git/quant"
+CUDA_DEVICE = "cuda:0"
 CHUNK_SIZE = 5
-HISTORY_FILE = "chat_history.json"
-CREATIVE_MODE = True
-HISTORY_TOKEN_LIMIT = 50000
-HISTORY_TOKEN_TRIM = 25000
 
+# Global context buffers
+instruction_context = []
+chat_context = []
+
+# Global Exllama variables
 model = None
 tokenizer = None
-chat_history = []
-creative_mode = CREATIVE_MODE
-chroma_client = ChromaClient(Settings(anonymized_telemetry=False))
-doc_collection = None
+generator = None
+settings = None
+cache = None
 
 
-class Message(BaseModel):
-    role: str
-    content: str
+# Load instruction memory from disk
+INSTRUCTION_FILE = "instruction_context.txt"
+if os.path.exists(INSTRUCTION_FILE):
+    with open(INSTRUCTION_FILE, "r") as f:
+        instruction_context = f.readlines()
+
+# FastAPI app setup
+app = FastAPI()
 
 
+# Input model for chat
 class ChatRequest(BaseModel):
-    model: str
-    messages: List[Message]
-    max_tokens: int = MAX_NEW_TOKENS
-    temperature: float = 0.7
-    top_p: float = 0.8
-    top_k: int = 20
-    stream: bool = False
-    creative: bool = CREATIVE_MODE
+    prompt: str
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global model, tokenizer, chat_history, doc_collection
-    print("🚀 Loading model...")
-    model = GPTQModel.load(MODEL_NAME, device=DEVICE)
-    tokenizer = model.tokenizer
-    print("✅ Model loaded.")
+def lazy_load_model():
+    # Load model + tokenizer
+    print("🔁 Loading model...")
+    args = type(
+        "Args",
+        (),
+        {
+            "model_dir": MODEL_DIR,
+            "gpu_split": None,
+            "tensor_parallel": False,
+            "length": None,
+            "rope_scale": None,
+            "rope_alpha": None,
+            "rope_yarn": None,
+            "no_flash_attn": False,
+            "no_xformers": False,
+            "no_sdpa": False,
+            "no_graphs": False,
+            "low_mem": False,
+            "experts_per_token": None,
+            "load_q4": False,
+            "load_q8": True,
+            "fast_safetensors": False,
+            "ignore_compatibility": True,
+            "chunk_size": PROMPT_LIMIT,
+        },
+    )()
+    global model, tokenizer, generator, settings, cache
+    model, tokenizer = model_init(
+        args, progress=True, max_input_len=PROMPT_LIMIT, max_output_len=RESPONSE_LIMIT
+    )
 
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r") as f:
-            chat_history = json.load(f)
+    settings = ExLlamaV2Sampler().Settings()
+    settings.temperature = 0.7
+    settings.top_k = 50
+    settings.top_p = 0.9
+    settings.token_repetition_penalty = 1.1
+    settings.eos_token_id = tokenizer.eos_token_id or 151643
+
+    cache = ExLlamaV2Cache_Q8(model, lazy=not model.loaded)
+
+    generator = ExLlamaV2StreamingGenerator(model, cache, tokenizer)
+    print("✅ Model fully loaded.")
+
+
+# Util to manage instruction token space
+def trim_instruction_context():
+    while tokenizer.num_tokens("\n".join(instruction_context)) > INSTRUCTION_LIMIT:
+        instruction_context.pop(0)
+    with open(INSTRUCTION_FILE, "w") as f:
+        f.writelines(instruction_context)
+
+
+# Core streaming logic
+def generate_stream(prompt: str) -> Generator[str, None, None]:
+    global generator, tokenizer, model, settings
+    start = time.time()
+
+    input_tokens = tokenizer.encode(prompt, add_bos=False, add_eos=False)
+    input_len = input_tokens.shape[1]
+
+    if input_len > PROMPT_LIMIT:
+        for i in range(0, input_len, PROMPT_LIMIT):
+            part = input_tokens[:, i : i + PROMPT_LIMIT]
+            model.forward(part)
     else:
-        chat_history = [{"role": "system", "content": "You are a helpful assistant."}]
+        model.forward(input_tokens)
 
-    doc_collection = chroma_client.get_or_create_collection(name="documents")
-    print("📚 Vector store ready.")
-    yield
+    generator = generator.begin_stream(input_tokens, settings=settings)
 
+    tokens = 0
+    buffer = []
 
-app = FastAPI(lifespan=lifespan)
+    for token in generator:
+        buffer.append(token)
+        tokens += 1
+        if len(buffer) >= CHUNK_SIZE:
+            decoded = tokenizer.decode(torch.tensor(buffer).unsqueeze(0))
+            yield decoded
+            buffer.clear()
+        if token == tokenizer.eos_token_id:
+            break
 
+    if buffer:
+        yield tokenizer.decode(torch.tensor(buffer).unsqueeze(0))
 
-def count_tokens(history):
-    prompt = tokenizer.apply_chat_template(
-        history, tokenize=True, add_generation_prompt=False
-    )
-    return len(prompt)
-
-
-def trim_chat_history():
-    global chat_history
-    while count_tokens(chat_history) > HISTORY_TOKEN_LIMIT:
-        trimmed = []
-        for msg in reversed(chat_history):
-            trimmed.insert(0, msg)
-            if count_tokens(trimmed) > HISTORY_TOKEN_TRIM:
-                trimmed.pop(0)
-                break
-        chat_history = trimmed
+    tps = tokens / (time.time() - start)
+    print(f"[Server] {tokens} tokens streamed at {tps:.2f} tokens/sec")
 
 
-@app.post("/v1/chat/completions")
-async def chat(req: ChatRequest):
-    global chat_history, creative_mode
-    max_tokens = min(req.max_tokens, MAX_NEW_TOKENS)
-    creative_mode = req.creative
-    chat_history += [m.dict() for m in req.messages]
-    trim_chat_history()
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    prompt = request.prompt.strip()
 
-    prompt = tokenizer.apply_chat_template(
-        chat_history, tokenize=False, add_generation_prompt=True
-    )
-    prompt_ids = (
-        tokenizer(prompt, return_tensors="pt").input_ids[0].to(model.model.device)
-    )
+    if prompt.startswith("/clear"):
+        chat_context.clear()
+        return JSONResponse(content={"message": "Chat context cleared."})
 
-    start_time = time.time()
-    generated_ids = model.generate(prompt, max_new_tokens=max_tokens)[0]
-    reply_ids = generated_ids[len(prompt_ids) :]
-    reply_text = tokenizer.decode(reply_ids, skip_special_tokens=True)
-    elapsed = time.time() - start_time
-    token_count = len(reply_ids)
-    print(
-        f"⚡ Generated {token_count} tokens in {elapsed:.2f}s ({token_count / elapsed:.2f} tokens/sec)"
-    )
+    elif prompt.startswith("/clearall"):
+        chat_context.clear()
+        instruction_context.clear()
+        open(INSTRUCTION_FILE, "w").close()
+        return JSONResponse(content={"message": "All context cleared."})
 
-    chat_history.append({"role": "assistant", "content": reply_text.strip()})
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(chat_history, f, indent=2)
+    elif prompt.startswith("/instruct"):
+        instruction = prompt[len("/instruct") :].strip()
+        instruction_context.append(instruction)
+        trim_instruction_context()
+        return JSONResponse(content={"message": "Instruction added."})
 
-    if req.stream:
+    elif prompt.startswith("/getfiletypes"):
+        return JSONResponse(content=".txt,.pdf,.zip,.tar.gz")
 
-        def token_generator():
-            buffer = ""
-            for char in reply_text:
-                buffer += char
-                if len(buffer) >= CHUNK_SIZE:
-                    yield json.dumps(
-                        {
-                            "id": "chatcmpl-local-qwen",
-                            "object": "chat.completion.chunk",
-                            "model": req.model,
-                            "choices": [
-                                {
-                                    "delta": {"role": "assistant", "content": buffer},
-                                    "index": 0,
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                    ) + "\n"
-                    buffer = ""
-                    time.sleep(0.01)
-            if buffer:
-                yield json.dumps(
-                    {
-                        "id": "chatcmpl-local-qwen",
-                        "object": "chat.completion.chunk",
-                        "model": req.model,
-                        "choices": [
-                            {
-                                "delta": {"role": "assistant", "content": buffer},
-                                "index": 0,
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                ) + "\n"
-            yield json.dumps(
-                {
-                    "id": "chatcmpl-local-qwen",
-                    "object": "chat.completion.chunk",
-                    "model": req.model,
-                    "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-                }
-            ) + "\n"
+    elif prompt.startswith("/upload"):
+        return JSONResponse(
+            content={"message": "Upload logic not yet implemented in this stub."}
+        )
 
-        return StreamingResponse(token_generator(), media_type="text/event-stream")
-
-    return {
-        "id": "chatcmpl-local-qwen",
-        "object": "chat.completion",
-        "model": req.model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": reply_text.strip()},
-                "finish_reason": "stop",
-            }
-        ],
-    }
+    chat_context.append(prompt)
+    return JSONResponse(content={"message": "Prompt received."})
 
 
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    global chat_history
-    text = (await file.read()).decode("utf-8", errors="ignore")
-    chunks = [text[i : i + 2048] for i in range(0, len(text), 2048)]
-    for i, chunk in enumerate(chunks):
-        chat_history.append({"role": "user", "content": f"File chunk {i+1}:{chunk}"})
-    return {"message": f"Uploaded and chunked {len(chunks)} parts."}
+@app.post("/stream")
+async def stream_chat(request: ChatRequest):
+    return StreamingResponse(generate_stream(request.prompt), media_type="text/plain")
 
 
-@app.post("/clear")
-async def clear_chat():
-    global chat_history
-    chat_history = [{"role": "system", "content": "You are a helpful assistant."}]
-    if os.path.exists(HISTORY_FILE):
-        os.remove(HISTORY_FILE)
-    return {"message": "Chat history cleared."}
-
-
-@app.post("/creative/{mode}")
-async def set_creative_mode(mode: str):
-    global creative_mode
-    creative_mode = mode.lower() == "on"
-    return {"creative_mode": creative_mode}
+@app.on_event("startup")
+async def startup_event():
+    lazy_load_model()
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("server:app", host="0.0.0.0", port=11434, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

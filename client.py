@@ -1,53 +1,72 @@
-import json
 
-import requests
+# client.py: Interactive rich client for chatting with the FastAPI LLM server
 
-API_URL = "http://localhost:11434/v1/chat/completions"
+import httpx
+import argparse
+import os
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.prompt import Prompt
+from rich.text import Text
+
+console = Console()
+
+API_URL = "http://localhost:8000"
 
 
-def stream_chat():
-    print("💬 Qwen Chat Interface (OpenAI-style streaming, type 'exit' to quit)\n")
+def get_supported_filetypes():
+    response = httpx.post(f"{API_URL}/chat", json={"prompt": "/getfiletypes"})
+    return response.text.strip().split(",")
 
+
+def upload_file(path):
+    if not os.path.isfile(path):
+        console.print(f"[red]File not found:[/red] {path}")
+        return
+    filetypes = get_supported_filetypes()
+    ext = os.path.splitext(path)[1]
+    if ext not in filetypes:
+        console.print(f"[red]Unsupported file type:[/red] {ext}")
+        return
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+    response = httpx.post(f"{API_URL}/chat", json={"prompt": f"/upload {path}"})
+    if response.status_code == 200:
+        console.print(f"[green]Uploaded:[/green] {path}")
+    else:
+        console.print(f"[red]Upload failed:[/red] {response.text}")
+
+
+def stream_chat(prompt):
+    with httpx.stream("POST", f"{API_URL}/stream", json={"prompt": prompt}, timeout=None) as response:
+        if response.status_code != 200:
+            console.print(f"[red]Error:[/red] {response.text}")
+            return
+        console.print("[blue]Assistant:[/blue]", end=" ", soft_wrap=True)
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                token = line.decode("utf-8")
+                console.print(token, end="", soft_wrap=True)
+            except Exception as e:
+                console.print(f"[red]Decode error:[/red] {e}")
+        console.print("")
+
+
+def main():
+    console.print("[bold green]Local LLM Client[/bold green] 🧠")
+    console.print("Type [bold]/exit[/bold] to quit. Use [bold]/clear[/bold], [bold]/upload <path>[/bold], etc.")
     while True:
-        user_input = input("🧑 You: ").strip()
-        if user_input.lower() == "exit":
+        user_input = Prompt.ask("[yellow]You[/yellow]")
+        if user_input.strip() == "/exit":
             break
-
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "model": "qwen2.5-14b-exllama",  # adjust name as needed
-            "messages": [{"role": "user", "content": user_input}],
-            "max_tokens": 2048,
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 50,
-            "stream": True,
-        }
-
-        print("🤖 Qwen: ", end="", flush=True)
-        try:
-            response = requests.post(
-                API_URL, headers=headers, json=payload, stream=True
-            )
-
-            for line in response.iter_lines():
-                if line:
-                    if line.startswith(b"data: "):
-                        try:
-                            chunk = json.loads(line[6:].decode("utf-8"))
-                            delta = chunk["choices"][0]["delta"]
-                            if "content" in delta:
-                                print(delta["content"], end="", flush=True)
-                        except json.JSONDecodeError:
-                            print(f"\n⚠️ Error decoding line: {line}")
-                    elif line == b"[DONE]":
-                        break
-        except KeyboardInterrupt:
-            print("\n✋ Interrupted by user")
-            break
-
-        print()  # newline after model response
+        elif user_input.startswith("/upload"):
+            _, path = user_input.split(maxsplit=1)
+            upload_file(path.strip())
+        else:
+            stream_chat(user_input)
 
 
 if __name__ == "__main__":
-    stream_chat()
+    main()

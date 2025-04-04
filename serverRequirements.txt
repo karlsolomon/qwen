@@ -1,0 +1,12 @@
+accelerate
+asyncio
+chromadb
+fastapi
+logging
+modelscope
+pydantic
+python-multipart
+torch
+transformers>4.37.0
+typing
+uvicorn
