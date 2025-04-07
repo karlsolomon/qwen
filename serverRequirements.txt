@@ -6,6 +6,7 @@ logging
 modelscope
 pydantic
 python-multipart
+safetensors
 torch
 transformers>4.37.0
 typing

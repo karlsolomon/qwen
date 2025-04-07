@@ -6,6 +6,7 @@ import os
 import time
 from typing import Generator
 
+import safetensors
 import torch
 import uvicorn
 from exllamav2 import ExLlamaV2, ExLlamaV2Cache_Q8, ExLlamaV2Tokenizer
@@ -15,6 +16,7 @@ from exllamav2.model_init import init as model_init
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from safetensors.torch import load_file, save_file
 
 # Configuration constants
 INSTRUCTION_LIMIT = 4096
@@ -22,6 +24,7 @@ CHAT_CONTEXT_LIMIT = 28672
 PROMPT_LIMIT = 2048
 RESPONSE_LIMIT = 4096
 MODEL_DIR = "/home/ksolomon/git/quant"
+SAFETENSORS_FILE = MODEL_DIR + "/model.safetensors"
 CUDA_DEVICE = "cuda:0"
 CHUNK_SIZE = 5
 
@@ -45,6 +48,45 @@ if os.path.exists(INSTRUCTION_FILE):
 
 # FastAPI app setup
 app = FastAPI()
+
+
+def get_model_params(model):
+    # Assume `model` is your trained neural network and it's already loaded onto GPU `cuda:0`
+    # Access the parameters as a Python generator
+    params = [param for param in model.parameters()]
+
+    # If you want to inspect or modify one specific parameter:
+    for name, param in model.named_parameters():
+        print(f"Parameter {name} is located at {param.device}")
+
+    # You might want to copy all parameters to CPU before further processing
+    params_cpu = [p.cpu() for p in params]
+
+    # Example of saving model state_dict
+    state_dict = model.state_dict()
+    torch.save(state_dict, "model_state.pth")
+
+    # Alternatively, if you just want a dictionary containing all tensors:
+    params_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+    for k, v in params_dict:
+        print(f"{k}:{v}")
+
+
+@app.post("/save")
+def save_checkpoint(model, filename="checkpoint.safetensors"):
+    """Save model state_dict using safetensors."""
+    state_dict = model.state_dict()
+    save_file(state_dict, filename)
+    print(f"Checkpoint saved at epoch: {filename}")
+
+
+@app.post("/load")
+def load_checkpoint(filename="checkpoint.safetensors", model=None):
+    """Load model state_dict from safetensors file."""
+    state_dict = load_file(filename)
+    assert isinstance(model, torch.nn.Module), "Please provide a valid torch model."
+    model.load_state_dict(state_dict)
+    print(f"Loaded checkpoint from: {filename}")
 
 
 # Input model for chat
@@ -168,6 +210,20 @@ async def chat(request: ChatRequest):
 
     elif prompt.startswith("/getfiletypes"):
         return JSONResponse(content=".txt,.pdf,.zip,.tar.gz")
+
+    elif prompt.startswith("/load"):
+        load_checkpoint(model, SAFETENSORS_FILE)
+        return JSONResponse(
+            content={"message": "Load .safetensors context from previous chat."}
+        )
+
+    elif prompt.startswith("/save"):
+        save_checkpoint(model, SAFETENSORS_FILE)
+        return JSONResponse(
+            content={
+                "message": "Save .safetensors context to be loaded in future chats."
+            }
+        )
 
     elif prompt.startswith("/upload"):
         return JSONResponse(
